@@ -1,0 +1,10 @@
+{
+  "name": "com.darksun.asmdef-manager",
+  "displayName": "Asmdef Manager",
+  "version": "0.1.0",
+  "dependencies": {
+  },
+  "author": {
+    "name": "hoangtongvu"
+  }
+}

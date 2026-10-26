@@ -1,0 +1,676 @@
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.PackageManager;
+using UnityEditor.UIElements;
+using UnityEngine;
+using UnityEngine.UIElements;
+using PackageInfo = UnityEditor.PackageManager.PackageInfo;
+
+namespace AsmdefManager;
+
+public class AsmdefManagerWindow : EditorWindow
+{
+    // ------------------------------------------------------------------ data
+
+    [Serializable]
+    class VersionDefine
+    {
+        public string name;
+        public string expression;
+        public string define;
+    }
+
+    // Mirrors the .asmdef JSON schema so we can round-trip it with JsonUtility.
+    [Serializable]
+    class AsmdefData
+    {
+        public string name;
+        public string rootNamespace;
+        public string[] references = new string[0];
+        public string[] includePlatforms = new string[0];
+        public string[] excludePlatforms = new string[0];
+        public bool allowUnsafeCode;
+        public bool overrideReferences;
+        public string[] precompiledReferences = new string[0];
+        public bool autoReferenced = true;
+        public string[] defineConstraints = new string[0];
+        public List<VersionDefine> versionDefines = new List<VersionDefine>();
+        public bool noEngineReferences;
+    }
+
+    // A reference that has been staged in memory but not written to disk yet.
+    [Serializable]
+    class PendingRef
+    {
+        public string targetPath; // asmdef that gets the reference
+        public string sourceGuid; // asmdef being referenced
+    }
+
+    class Entry
+    {
+        public string Name;
+        public string Path;      // asset path, e.g. Assets/Foo/Foo.asmdef
+        public string FullPath;  // absolute file path on disk
+        public string Guid;
+        public AsmdefData Data;
+    }
+
+    const string DragKey = "AsmdefManager.Entry";
+    static readonly Color SelectedColor = new Color(0.17f, 0.36f, 0.53f, 1f);
+    static readonly Color HoverColor = new Color(1f, 1f, 1f, 0.08f);
+    static readonly Color DropColor = new Color(0.95f, 0.75f, 0.2f, 1f);
+
+    // ----------------------------------------------------------------- state
+
+    [SerializeField] string selectedPath;
+    [SerializeField] bool autoApply;
+    [SerializeField] List<PendingRef> pending = new List<PendingRef>();
+    string search = "";
+
+    readonly List<Entry> entries = new List<Entry>();
+    ScrollView listScroll;
+    VisualElement inspectorHost;
+    VisualElement pendingHost;
+    ToolbarButton applyButton;
+    ToolbarButton discardButton;
+    // The assembly selected in the list: target of ">" and subject of the 2nd view.
+    Entry InspectedEntry => FindByPath(selectedPath);
+
+    [MenuItem("Tools/Asmdef Manager")]
+    static void Open()
+    {
+        var w = GetWindow<AsmdefManagerWindow>();
+        w.titleContent = new GUIContent("Asmdef Manager");
+        w.minSize = new Vector2(480, 240);
+        w.Show();
+    }
+
+    // -------------------------------------------------------------------- UI
+
+    void CreateGUI()
+    {
+        var root = rootVisualElement;
+        root.Clear();
+
+        saveChangesMessage = "There are asmdef reference changes that haven't been applied yet. Apply them now?";
+
+        // Search bar (top)
+        var toolbar = new Toolbar();
+        var searchField = new ToolbarSearchField { value = search };
+        searchField.style.flexGrow = 1;
+        searchField.style.marginLeft = 4;
+        searchField.style.marginRight = 4;
+        searchField.RegisterValueChangedCallback(e =>
+        {
+            search = e.newValue ?? "";
+            RebuildList();
+        });
+        toolbar.Add(searchField);
+
+        var autoToggle = new ToolbarToggle
+        {
+            text = "Auto apply",
+            value = autoApply,
+            tooltip = "ON: every added reference is written (and compiled) immediately.\n" +
+                      "OFF: references are staged and written together when you press Apply."
+        };
+        autoToggle.RegisterValueChangedCallback(e => autoApply = e.newValue);
+        toolbar.Add(autoToggle);
+
+        applyButton = new ToolbarButton(ApplyPending)
+        {
+            tooltip = "Write all staged references to disk in one batch (one compile)."
+        };
+        toolbar.Add(applyButton);
+        discardButton = new ToolbarButton(DiscardPending) { text = "Discard" };
+        toolbar.Add(discardButton);
+        toolbar.Add(new ToolbarButton(() => ReloadEntries(true)) { text = "Refresh" });
+        root.Add(toolbar);
+
+        // Assemblies view: split view
+        var split = new TwoPaneSplitView(0, 260, TwoPaneSplitViewOrientation.Horizontal);
+        split.style.flexGrow = 1;
+        root.Add(split);
+
+        // First view: scroll view with entries
+        var left = new VisualElement();
+        left.style.flexGrow = 1;
+        listScroll = new ScrollView(ScrollViewMode.Vertical);
+        listScroll.style.flexGrow = 1;
+        left.Add(listScroll);
+        split.Add(left);
+
+        // Second view: staged references of the selected assembly
+        inspectorHost = new VisualElement();
+        inspectorHost.style.flexGrow = 1;
+        split.Add(inspectorHost);
+
+        ReloadEntries(true);
+    }
+
+    // Called by Unity whenever the project's assets change.
+    void OnProjectChange()
+    {
+        if (listScroll == null) return;
+        rootVisualElement.schedule.Execute(() => ReloadEntries(false)).ExecuteLater(50);
+    }
+
+    // Unity's built-in "unsaved changes" hooks (prompts when the window is closed).
+    public override void SaveChanges()
+    {
+        ApplyPending();
+        base.SaveChanges();
+    }
+
+    public override void DiscardChanges()
+    {
+        pending.Clear();
+        base.DiscardChanges();
+    }
+
+    // ------------------------------------------------------------ list logic
+
+    void ReloadEntries(bool forceInspector)
+    {
+        entries.Clear();
+
+        foreach (var guid in AssetDatabase.FindAssets("t:AssemblyDefinitionAsset"))
+        {
+            var path = AssetDatabase.GUIDToAssetPath(guid);
+            if (!path.EndsWith(".asmdef", StringComparison.OrdinalIgnoreCase)) continue;
+            if (!IsUserDefined(path)) continue;
+
+            try
+            {
+                var full = GetFullPath(path);
+                var data = JsonUtility.FromJson<AsmdefData>(File.ReadAllText(full));
+                if (data == null || string.IsNullOrEmpty(data.name)) continue;
+                entries.Add(new Entry { Name = data.name, Path = path, FullPath = full, Guid = guid, Data = data });
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Asmdef Manager] Could not read {path}: {ex.Message}");
+            }
+        }
+
+        entries.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+
+        bool inspectorInvalid = forceInspector;
+
+        if (FindByPath(selectedPath) == null)
+        {
+            selectedPath = null;
+            inspectorInvalid = true;
+        }
+
+        // Drop staged references whose assemblies no longer exist.
+        pending.RemoveAll(p => FindByPath(p.targetPath) == null || FindByGuid(p.sourceGuid) == null);
+
+        RebuildList();
+        if (inspectorInvalid) BuildInspector();
+        else UpdatePendingPanel();
+        UpdateToolbar();
+    }
+
+    void RebuildList()
+    {
+        if (listScroll == null) return;
+        listScroll.Clear();
+
+        foreach (var entry in entries)
+        {
+            if (!string.IsNullOrEmpty(search) &&
+                entry.Name.IndexOf(search, StringComparison.OrdinalIgnoreCase) < 0)
+                continue;
+            listScroll.Add(MakeEntryElement(entry));
+        }
+    }
+
+    VisualElement MakeEntryElement(Entry entry)
+    {
+        var row = new VisualElement { userData = entry, tooltip = entry.Path };
+        row.style.flexDirection = FlexDirection.Row;
+        row.style.alignItems = Align.Center;
+        row.style.paddingLeft = 6;
+        row.style.paddingRight = 0;
+        row.style.paddingTop = 2;
+        row.style.paddingBottom = 2;
+        SetBorder(row, 0, DropColor);
+
+        var label = new Label(entry.Name) { pickingMode = PickingMode.Ignore };
+        label.style.flexGrow = 1;
+        label.style.flexShrink = 1;
+        label.style.overflow = Overflow.Hidden;
+        label.style.unityTextAlign = TextAnchor.MiddleLeft;
+        row.Add(label);
+
+        // Small status text: "+2" = number of staged references.
+        var info = new Label { name = "info", pickingMode = PickingMode.Ignore };
+        info.style.fontSize = 10;
+        info.style.opacity = 0.8f;
+        info.style.marginLeft = 4;
+        info.style.marginRight = 4;
+        info.style.flexShrink = 0;
+        row.Add(info);
+
+        // ">" : add this assembly as a reference of the inspected selected assembly.
+        var addBtn = new Button(() =>
+        {
+            var target = InspectedEntry;
+            if (target != null) AddReference(target, entry);
+        })
+        { name = "addRef", text = ">" };
+        addBtn.style.width = 20;
+        addBtn.style.flexShrink = 0;
+
+        addBtn.style.borderTopWidth = 0;
+        addBtn.style.borderBottomWidth = 0;
+        addBtn.style.borderLeftWidth = 0;
+        addBtn.style.borderRightWidth = 0;
+
+        addBtn.style.paddingLeft = 0;
+        addBtn.style.paddingRight = 0;
+        addBtn.style.paddingTop = 0;
+        addBtn.style.paddingBottom = 0;
+
+        // Don't let a press on the button start a select/drag on the row.
+        addBtn.RegisterCallback<PointerDownEvent>(e => e.StopPropagation());
+        row.Add(addBtn);
+
+        // ---- click-to-select on mouse up, drag-to-reference ----
+        bool pressed = false;
+        Vector3 pressPos = default;
+
+        row.RegisterCallback<PointerEnterEvent>(_ => SetRowBackground(row, true));
+        row.RegisterCallback<PointerLeaveEvent>(_ => SetRowBackground(row, false));
+
+        row.RegisterCallback<PointerDownEvent>(e =>
+        {
+            if (e.button != 0) return;
+            pressed = true;
+            pressPos = e.position;
+            row.CapturePointer(e.pointerId);
+        });
+
+        row.RegisterCallback<PointerMoveEvent>(e =>
+        {
+            if (!pressed) return;
+            if ((e.position - pressPos).sqrMagnitude < 25f) return; // 5px threshold
+
+            pressed = false;
+            row.ReleasePointer(e.pointerId);
+
+            DragAndDrop.PrepareStartDrag();
+            DragAndDrop.SetGenericData(DragKey, entry);
+            DragAndDrop.StartDrag(entry.Name);
+        });
+
+        row.RegisterCallback<PointerUpEvent>(e =>
+        {
+            if (!pressed || e.button != 0) return;
+            pressed = false;
+            row.ReleasePointer(e.pointerId);
+            if (row.worldBound.Contains(e.position))
+                Select(entry);
+        });
+
+        row.RegisterCallback<PointerCaptureOutEvent>(_ => pressed = false);
+
+        // ---- drop target: dragging A onto B adds A to B's references ----
+        row.RegisterCallback<DragEnterEvent>(_ =>
+        {
+            if (CanDrop(entry)) SetBorder(row, 1, DropColor);
+        });
+        row.RegisterCallback<DragLeaveEvent>(_ => SetBorder(row, 0, DropColor));
+        row.RegisterCallback<DragExitedEvent>(_ => SetBorder(row, 0, DropColor));
+        row.RegisterCallback<DragUpdatedEvent>(_ =>
+        {
+            DragAndDrop.visualMode = CanDrop(entry)
+                ? DragAndDropVisualMode.Link
+                : DragAndDropVisualMode.Rejected;
+        });
+        row.RegisterCallback<DragPerformEvent>(_ =>
+        {
+            SetBorder(row, 0, DropColor);
+            if (!CanDrop(entry)) return;
+            DragAndDrop.AcceptDrag();
+            var source = (Entry)DragAndDrop.GetGenericData(DragKey);
+            AddReference(entry, source);
+        });
+
+        RefreshRow(row);
+        return row;
+    }
+
+    static bool CanDrop(Entry target)
+    {
+        var source = DragAndDrop.GetGenericData(DragKey) as Entry;
+        return source != null && source != target;
+    }
+
+    static void SetBorder(VisualElement ve, float width, Color color)
+    {
+        ve.style.borderTopWidth = ve.style.borderBottomWidth =
+            ve.style.borderLeftWidth = ve.style.borderRightWidth = width;
+        ve.style.borderTopColor = ve.style.borderBottomColor =
+            ve.style.borderLeftColor = ve.style.borderRightColor = color;
+    }
+
+    void SetRowBackground(VisualElement row, bool hover)
+    {
+        var entry = (Entry)row.userData;
+        if (entry.Path == selectedPath)
+            row.style.backgroundColor = SelectedColor;
+        else
+            row.style.backgroundColor = hover ? HoverColor : Color.clear;
+    }
+
+    // Refreshes background, status text and the ">" button of one row.
+    void RefreshRow(VisualElement row)
+    {
+        var entry = (Entry)row.userData;
+        var target = InspectedEntry;
+
+        SetRowBackground(row, false);
+
+        int stagedCount = pending.Count(p => p.targetPath == entry.Path);
+        var infoParts = new List<string>();
+        if (stagedCount > 0) infoParts.Add("+" + stagedCount);
+        row.Q<Label>("info").text = string.Join(" ", infoParts);
+
+        var btn = row.Q<Button>("addRef");
+        if (target == null)
+        {
+            btn.SetEnabled(false);
+            btn.tooltip = "Select an assembly first";
+        }
+        else if (target == entry)
+        {
+            btn.SetEnabled(false);
+            btn.tooltip = "Can't reference itself";
+        }
+        else if (EffectiveContains(target, entry))
+        {
+            btn.SetEnabled(false);
+            btn.tooltip = $"'{target.Name}' already references '{entry.Name}'";
+        }
+        else
+        {
+            btn.SetEnabled(true);
+            btn.tooltip = $"Add '{entry.Name}' as a reference of '{target.Name}'";
+        }
+    }
+
+    void RefreshRows()
+    {
+        if (listScroll == null) return;
+        foreach (var child in listScroll.contentContainer.Children())
+            RefreshRow(child);
+    }
+
+    // Refreshes everything that depends on selection / pin / staged references.
+    void RefreshAll()
+    {
+        RefreshRows();
+        UpdatePendingPanel();
+        UpdateToolbar();
+    }
+
+    void UpdateToolbar()
+    {
+        if (applyButton == null) return;
+        applyButton.text = $"Apply ({pending.Count})";
+        applyButton.SetEnabled(pending.Count > 0);
+        discardButton.SetEnabled(pending.Count > 0);
+        hasUnsavedChanges = pending.Count > 0;
+    }
+
+    // -------------------------------------------------------------- selection
+
+    void Select(Entry entry)
+    {
+        selectedPath = entry.Path;
+
+        // Let Unity's own Inspector show the asmdef (Revert/Apply included).
+        var asset = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(entry.Path);
+        if (asset != null) Selection.activeObject = asset;
+
+        RefreshRows();
+        BuildInspector();
+    }
+
+    // 2nd view: the staged references of the selected assembly.
+    void BuildInspector()
+    {
+        if (inspectorHost == null) return;
+
+        inspectorHost.Clear();
+        pendingHost = null;
+
+        // Show nothing if no entry is selected.
+        var entry = InspectedEntry;
+        if (entry == null) return;
+
+        var title = new Label(entry.Name);
+        title.style.unityFontStyleAndWeight = FontStyle.Bold;
+        title.style.paddingLeft = 6;
+        title.style.paddingTop = 4;
+        title.style.paddingBottom = 4;
+        inspectorHost.Add(title);
+
+        pendingHost = new VisualElement();
+        inspectorHost.Add(pendingHost);
+        UpdatePendingPanel();
+        UpdateToolbar();
+    }
+
+    // Lists the staged (not yet written) references of the inspected assembly.
+    void UpdatePendingPanel()
+    {
+        if (pendingHost == null) return;
+        pendingHost.Clear();
+
+        var entry = InspectedEntry;
+        var items = entry == null
+            ? new List<PendingRef>()
+            : pending.Where(p => p.targetPath == entry.Path).ToList();
+
+        if (items.Count == 0)
+        {
+            var hint = new Label("No staged references. Use \">\" or drag another assembly onto an entry.");
+            hint.style.paddingLeft = 6;
+            hint.style.opacity = 0.6f;
+            hint.style.whiteSpace = WhiteSpace.Normal;
+            pendingHost.style.backgroundColor = Color.clear;
+            pendingHost.Add(hint);
+            return;
+        }
+
+        pendingHost.style.backgroundColor = new Color(0.95f, 0.75f, 0.2f, 0.12f);
+        pendingHost.style.paddingLeft = 6;
+        pendingHost.style.paddingRight = 6;
+        pendingHost.style.paddingTop = 4;
+        pendingHost.style.paddingBottom = 4;
+        pendingHost.style.marginBottom = 4;
+
+        var heading = new Label("Staged references (not applied yet)");
+        heading.style.unityFontStyleAndWeight = FontStyle.Bold;
+        pendingHost.Add(heading);
+
+        foreach (var item in items)
+        {
+            var captured = item;
+            var source = FindByGuid(item.sourceGuid);
+
+            var line = new VisualElement();
+            line.style.flexDirection = FlexDirection.Row;
+            line.style.alignItems = Align.Center;
+
+            var name = new Label(source != null ? source.Name : item.sourceGuid);
+            name.style.flexGrow = 1;
+            line.Add(name);
+            line.Add(new Button(() =>
+            {
+                pending.Remove(captured);
+                RefreshAll();
+            })
+            { text = "x", tooltip = "Remove this staged reference" });
+
+            pendingHost.Add(line);
+        }
+    }
+
+    // ------------------------------------------------------------ references
+
+    // Stages "source" as a reference of "target". Nothing is written (and nothing
+    // compiles) until ApplyPending runs, unless "Auto apply" is on.
+    void AddReference(Entry target, Entry source)
+    {
+        if (target == source) return;
+
+        if (EffectiveContains(target, source))
+        {
+            ShowNotification(new GUIContent($"{target.Name} already references {source.Name}"));
+            return;
+        }
+
+        // Unity rejects cyclic assembly references, so check (including staged ones).
+        if (Reaches(source, target, new HashSet<Entry>()))
+        {
+            ShowNotification(new GUIContent(
+                $"Cyclic reference: {source.Name} already depends on {target.Name}"));
+            return;
+        }
+
+        pending.Add(new PendingRef { targetPath = target.Path, sourceGuid = source.Guid });
+
+        if (autoApply)
+        {
+            ApplyPending();
+        }
+        else
+        {
+            RefreshAll();
+            ShowNotification(new GUIContent($"Staged '{source.Name}' > '{target.Name}'"));
+        }
+    }
+
+    // Writes every staged reference to disk inside ONE asset-editing batch,
+    // so Unity imports the changed asmdefs together and compiles once.
+    void ApplyPending()
+    {
+        if (pending.Count == 0) return;
+
+        int written = 0;
+        AssetDatabase.StartAssetEditing();
+        try
+        {
+            foreach (var group in pending.GroupBy(p => p.targetPath).ToList())
+            {
+                var target = FindByPath(group.Key);
+                if (target == null) continue;
+
+                // Re-read from disk so we never overwrite edits made elsewhere.
+                var data = JsonUtility.FromJson<AsmdefData>(File.ReadAllText(target.FullPath));
+                var refs = (data.references ?? new string[0]).ToList();
+                foreach (var p in group)
+                {
+                    var r = "GUID:" + p.sourceGuid;
+                    if (!refs.Contains(r)) refs.Add(r);
+                }
+                data.references = refs.ToArray();
+
+                File.WriteAllText(target.FullPath, JsonUtility.ToJson(data, true));
+                AssetDatabase.ImportAsset(target.Path, ImportAssetOptions.ForceUpdate);
+                written++;
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"[Asmdef Manager] Failed to apply references: {ex}");
+            return;
+        }
+        finally
+        {
+            AssetDatabase.StopAssetEditing();
+        }
+
+        pending.Clear();
+        ShowNotification(new GUIContent($"Applied references to {written} assembl{(written == 1 ? "y" : "ies")}"));
+        ReloadEntries(true);
+    }
+
+    void DiscardPending()
+    {
+        pending.Clear();
+        RefreshAll();
+    }
+
+    // Disk references + staged references.
+    IEnumerable<string> EffectiveRefs(Entry e)
+    {
+        var onDisk = e.Data.references ?? new string[0];
+        var staged = pending.Where(p => p.targetPath == e.Path).Select(p => "GUID:" + p.sourceGuid);
+        return onDisk.Concat(staged);
+    }
+
+    bool EffectiveContains(Entry owner, Entry candidate)
+    {
+        foreach (var r in EffectiveRefs(owner))
+            if (Resolve(r) == candidate) return true;
+        return false;
+    }
+
+    // True if 'from' depends (directly or transitively) on 'to'.
+    bool Reaches(Entry from, Entry to, HashSet<Entry> visited)
+    {
+        if (!visited.Add(from)) return false;
+        foreach (var r in EffectiveRefs(from))
+        {
+            var next = Resolve(r);
+            if (next == null) continue;
+            if (next == to) return true;
+            if (Reaches(next, to, visited)) return true;
+        }
+        return false;
+    }
+
+    // References are stored either as "GUID:xxxx" or by assembly name.
+    Entry Resolve(string reference)
+    {
+        if (string.IsNullOrEmpty(reference)) return null;
+        if (reference.StartsWith("GUID:", StringComparison.OrdinalIgnoreCase))
+            return FindByGuid(reference.Substring(5));
+        return entries.FirstOrDefault(e => e.Name == reference);
+    }
+
+    Entry FindByPath(string path) =>
+        string.IsNullOrEmpty(path) ? null : entries.FirstOrDefault(e => e.Path == path);
+
+    Entry FindByGuid(string guid) =>
+        string.IsNullOrEmpty(guid) ? null : entries.FirstOrDefault(e => e.Guid == guid);
+
+    // --------------------------------------------------------------- helpers
+
+    // "User-defined": project assets plus embedded/local packages (not registry/built-in/git).
+    static bool IsUserDefined(string assetPath)
+    {
+        var pkg = PackageInfo.FindForAssetPath(assetPath);
+        if (pkg == null) return assetPath.StartsWith("Assets/", StringComparison.Ordinal);
+        return pkg.source == PackageSource.Embedded || pkg.source == PackageSource.Local;
+    }
+
+    static string GetFullPath(string assetPath)
+    {
+        var pkg = PackageInfo.FindForAssetPath(assetPath);
+        if (pkg != null && assetPath.Length > pkg.assetPath.Length)
+        {
+            var relative = assetPath.Substring(pkg.assetPath.Length).TrimStart('/');
+            return System.IO.Path.GetFullPath(System.IO.Path.Combine(pkg.resolvedPath, relative));
+        }
+        return System.IO.Path.GetFullPath(assetPath);
+    }
+}
