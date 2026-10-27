@@ -13,67 +13,26 @@ namespace AsmdefManager;
 
 public class AsmdefManagerWindow : EditorWindow
 {
-    // ------------------------------------------------------------------ data
-
-    [Serializable]
-    class VersionDefine
-    {
-        public string name;
-        public string expression;
-        public string define;
-    }
-
-    // Mirrors the .asmdef JSON schema so we can round-trip it with JsonUtility.
-    [Serializable]
-    class AsmdefData
-    {
-        public string name;
-        public string rootNamespace;
-        public string[] references = new string[0];
-        public string[] includePlatforms = new string[0];
-        public string[] excludePlatforms = new string[0];
-        public bool allowUnsafeCode;
-        public bool overrideReferences;
-        public string[] precompiledReferences = new string[0];
-        public bool autoReferenced = true;
-        public string[] defineConstraints = new string[0];
-        public List<VersionDefine> versionDefines = new List<VersionDefine>();
-        public bool noEngineReferences;
-    }
-
-    // A reference that has been staged in memory but not written to disk yet.
-    [Serializable]
-    class PendingRef
-    {
-        public string targetPath; // asmdef that gets the reference
-        public string sourceGuid; // asmdef being referenced
-    }
-
-    class Entry
-    {
-        public string Name;
-        public string Path;      // asset path, e.g. Assets/Foo/Foo.asmdef
-        public string FullPath;  // absolute file path on disk
-        public string Guid;
-        public AsmdefData Data;
-    }
-
     const string DragKey = "AsmdefManager.Entry";
-    static readonly Color SelectedColor = new Color(0.17f, 0.36f, 0.53f, 1f);
-    static readonly Color HoverColor = new Color(1f, 1f, 1f, 0.08f);
-    static readonly Color DropColor = new Color(0.95f, 0.75f, 0.2f, 1f);
+    static readonly Color SelectedColor = new(0.17f, 0.36f, 0.53f, 1f);
+    static readonly Color HoverColor = new(1f, 1f, 1f, 0.08f);
+    static readonly Color DropColor = new(0.95f, 0.75f, 0.2f, 1f);
 
     // ----------------------------------------------------------------- state
 
     [SerializeField] string selectedPath;
     [SerializeField] bool autoApply;
-    [SerializeField] List<PendingRef> pending = new List<PendingRef>();
+    [SerializeField] bool sortOnApply = true;
+    [SerializeField] List<PendingRef> pending = new();
     string search = "";
 
-    readonly List<Entry> entries = new List<Entry>();
+    readonly List<Entry> entries = new();
+    readonly Dictionary<string, AsmInfo> infoByGuid = new();
+    readonly Dictionary<string, AsmInfo> infoByName = new();
     ScrollView listScroll;
     VisualElement inspectorHost;
     VisualElement pendingHost;
+    VisualElement refsHost;
     ToolbarButton applyButton;
     ToolbarButton discardButton;
     // The assembly selected in the list: target of ">" and subject of the 2nd view.
@@ -119,6 +78,16 @@ public class AsmdefManagerWindow : EditorWindow
         };
         autoToggle.RegisterValueChangedCallback(e => autoApply = e.newValue);
         toolbar.Add(autoToggle);
+
+        var sortToggle = new ToolbarToggle
+        {
+            text = "Sort on apply",
+            value = sortOnApply,
+            tooltip = "Also sort the references of every assembly written by Apply:\n" +
+                      "Unity registry packages, then user assemblies, then other packages."
+        };
+        sortToggle.RegisterValueChangedCallback(e => sortOnApply = e.newValue);
+        toolbar.Add(sortToggle);
 
         applyButton = new ToolbarButton(ApplyPending)
         {
@@ -176,19 +145,25 @@ public class AsmdefManagerWindow : EditorWindow
     void ReloadEntries(bool forceInspector)
     {
         entries.Clear();
+        infoByGuid.Clear();
+        infoByName.Clear();
 
         foreach (var guid in AssetDatabase.FindAssets("t:AssemblyDefinitionAsset"))
         {
             var path = AssetDatabase.GUIDToAssetPath(guid);
             if (!path.EndsWith(".asmdef", StringComparison.OrdinalIgnoreCase)) continue;
-            if (!IsUserDefined(path)) continue;
 
             try
             {
                 var full = GetFullPath(path);
                 var data = JsonUtility.FromJson<AsmdefData>(File.ReadAllText(full));
                 if (data == null || string.IsNullOrEmpty(data.name)) continue;
-                entries.Add(new Entry { Name = data.name, Path = path, FullPath = full, Guid = guid, Data = data });
+                var category = GetCategory(path);
+                var info = new AsmInfo { Name = data.name, Guid = guid, Category = category };
+                infoByGuid[guid] = info;
+                infoByName[data.name] = info;
+                if (category == RefCategory.UserAssembly)
+                    entries.Add(new Entry { Name = data.name, Path = path, FullPath = full, Guid = guid, Data = data });
             }
             catch (Exception ex)
             {
@@ -442,34 +417,109 @@ public class AsmdefManagerWindow : EditorWindow
         BuildInspector();
     }
 
-    // 2nd view: the staged references of the selected assembly.
+    // 2nd view: staged + categorized references of the selected assembly.
     void BuildInspector()
     {
         if (inspectorHost == null) return;
 
         inspectorHost.Clear();
         pendingHost = null;
+        refsHost = null;
 
         // Show nothing if no entry is selected.
         var entry = InspectedEntry;
         if (entry == null) return;
 
+        var header = new VisualElement();
+        header.style.flexDirection = FlexDirection.Row;
+        header.style.alignItems = Align.Center;
+        header.style.paddingLeft = 6;
+        header.style.paddingRight = 6;
+        header.style.paddingTop = 4;
+        header.style.paddingBottom = 4;
+
         var title = new Label(entry.Name);
         title.style.unityFontStyleAndWeight = FontStyle.Bold;
-        title.style.paddingLeft = 6;
-        title.style.paddingTop = 4;
-        title.style.paddingBottom = 4;
-        inspectorHost.Add(title);
+        title.style.flexGrow = 1;
+        title.style.overflow = Overflow.Hidden;
+        header.Add(title);
+        header.Add(new Button(() => SortReferences(entry))
+        {
+            text = "Sort references",
+            tooltip = "Rewrite this asmdef's references ordered by category, then by name.\n" +
+                      "Staged references for it are written too."
+        });
+        inspectorHost.Add(header);
 
         pendingHost = new VisualElement();
         inspectorHost.Add(pendingHost);
+
+        var scroll = new ScrollView(ScrollViewMode.Vertical);
+        scroll.style.flexGrow = 1;
+        refsHost = new VisualElement();
+        scroll.Add(refsHost);
+        inspectorHost.Add(scroll);
+
         UpdatePendingPanel();
         UpdateToolbar();
+    }
+
+    // Shows the assembly's references (disk + staged) grouped by category.
+    void UpdateRefsPanel()
+    {
+        if (refsHost == null) return;
+        refsHost.Clear();
+
+        var entry = InspectedEntry;
+        if (entry == null) return;
+
+        var disk = entry.Data.references ?? new string[0];
+        bool fileSorted = disk.SequenceEqual(SortRefs(disk));
+        var staged = new HashSet<string>(
+            pending.Where(p => p.targetPath == entry.Path).Select(p => "GUID:" + p.sourceGuid));
+        var sortedAll = SortRefs(EffectiveRefs(entry));
+
+        refsHost.style.paddingLeft = 6;
+        refsHost.style.paddingRight = 6;
+
+        var heading = new Label(fileSorted ? "References" : "References (file order is not sorted)");
+        heading.style.unityFontStyleAndWeight = FontStyle.Bold;
+        heading.style.marginBottom = 2;
+        refsHost.Add(heading);
+
+        if (sortedAll.Count == 0)
+        {
+            var none = new Label("No references.");
+            none.style.opacity = 0.6f;
+            refsHost.Add(none);
+            return;
+        }
+
+        foreach (RefCategory cat in Enum.GetValues(typeof(RefCategory)))
+        {
+            var items = sortedAll.Where(r => CategoryOf(r) == cat).ToList();
+            if (items.Count == 0) continue;
+
+            var catLabel = new Label($"{CategoryLabel(cat)} ({items.Count})");
+            catLabel.style.unityFontStyleAndWeight = FontStyle.Bold;
+            catLabel.style.fontSize = 11;
+            catLabel.style.marginTop = 4;
+            refsHost.Add(catLabel);
+
+            foreach (var r in items)
+            {
+                var line = new Label(RefName(r) + (staged.Contains(r) ? "  (staged)" : ""));
+                line.style.opacity = 0.8f;
+                line.style.paddingLeft = 10;
+                refsHost.Add(line);
+            }
+        }
     }
 
     // Lists the staged (not yet written) references of the inspected assembly.
     void UpdatePendingPanel()
     {
+        UpdateRefsPanel();
         if (pendingHost == null) return;
         pendingHost.Clear();
 
@@ -554,35 +604,47 @@ public class AsmdefManagerWindow : EditorWindow
         else
         {
             RefreshAll();
-            ShowNotification(new GUIContent($"Staged '{source.Name}' > '{target.Name}'"));
+            ShowNotification(new GUIContent($"Staged {source.Name} > {target.Name}"));
         }
     }
 
-    // Writes every staged reference to disk inside ONE asset-editing batch,
-    // so Unity imports the changed asmdefs together and compiles once.
-    void ApplyPending()
+    void ApplyPending() => WriteReferences(null, sortOnApply);
+
+    void SortReferences(Entry target) => WriteReferences(target.Path, true);
+
+    // Writes staged references (and optionally sorts the references) inside ONE
+    // asset-editing batch, so Unity imports the changed asmdefs together and compiles once.
+    // onlyPath == null: every assembly with staged references; otherwise just that asmdef.
+    void WriteReferences(string onlyPath, bool sort)
     {
-        if (pending.Count == 0) return;
+        var paths = onlyPath != null
+            ? new List<string> { onlyPath }
+            : pending.Select(p => p.targetPath).Distinct().ToList();
+        if (paths.Count == 0) return;
 
         int written = 0;
         AssetDatabase.StartAssetEditing();
         try
         {
-            foreach (var group in pending.GroupBy(p => p.targetPath).ToList())
+            foreach (var path in paths)
             {
-                var target = FindByPath(group.Key);
+                var target = FindByPath(path);
                 if (target == null) continue;
 
                 // Re-read from disk so we never overwrite edits made elsewhere.
                 var data = JsonUtility.FromJson<AsmdefData>(File.ReadAllText(target.FullPath));
-                var refs = (data.references ?? new string[0]).ToList();
-                foreach (var p in group)
+                var original = data.references ?? new string[0];
+                var refs = original.ToList();
+                foreach (var p in pending.Where(p => p.targetPath == path))
                 {
                     var r = "GUID:" + p.sourceGuid;
                     if (!refs.Contains(r)) refs.Add(r);
                 }
-                data.references = refs.ToArray();
+                if (sort) refs = SortRefs(refs);
 
+                if (refs.SequenceEqual(original)) continue;
+
+                data.references = refs.ToArray();
                 File.WriteAllText(target.FullPath, JsonUtility.ToJson(data, true));
                 AssetDatabase.ImportAsset(target.Path, ImportAssetOptions.ForceUpdate);
                 written++;
@@ -590,7 +652,7 @@ public class AsmdefManagerWindow : EditorWindow
         }
         catch (Exception ex)
         {
-            Debug.LogError($"[Asmdef Manager] Failed to apply references: {ex}");
+            Debug.LogError($"[Asmdef Manager] Failed to write references: {ex}");
             return;
         }
         finally
@@ -598,8 +660,10 @@ public class AsmdefManagerWindow : EditorWindow
             AssetDatabase.StopAssetEditing();
         }
 
-        pending.Clear();
-        ShowNotification(new GUIContent($"Applied references to {written} assembl{(written == 1 ? "y" : "ies")}"));
+        pending.RemoveAll(p => paths.Contains(p.targetPath));
+        ShowNotification(new GUIContent(written == 0
+            ? "Nothing to change"
+            : $"Updated references of {written} assembl{(written == 1 ? "y" : "ies")}"));
         ReloadEntries(true);
     }
 
@@ -638,6 +702,54 @@ public class AsmdefManagerWindow : EditorWindow
         return false;
     }
 
+    // ---- reference categorization / sorting ----
+
+    // References are stored either as "GUID:xxxx" or by assembly name.
+    AsmInfo ResolveInfo(string reference)
+    {
+        if (string.IsNullOrEmpty(reference)) return null;
+        AsmInfo info;
+        if (reference.StartsWith("GUID:", StringComparison.OrdinalIgnoreCase))
+            return infoByGuid.TryGetValue(reference.Substring(5), out info) ? info : null;
+        return infoByName.TryGetValue(reference, out info) ? info : null;
+    }
+
+    RefCategory CategoryOf(string reference)
+    {
+        var info = ResolveInfo(reference);
+        return info != null ? info.Category : RefCategory.Unknown;
+    }
+
+    string RefName(string reference)
+    {
+        var info = ResolveInfo(reference);
+        return info != null ? info.Name : reference;
+    }
+
+    static string CategoryLabel(RefCategory c)
+    {
+        switch (c)
+        {
+            case RefCategory.Registry: return "Registry packages";
+            case RefCategory.BuiltIn: return "Built-in packages";
+            case RefCategory.Embedded: return "Embedded packages";
+            case RefCategory.Local: return "Local packages";
+            case RefCategory.Git: return "Git packages";
+            case RefCategory.LocalTarball: return "Local Tarball packages";
+            case RefCategory.UserAssembly: return "User-defined assemblies";
+            default: return "Unknown packages";
+        }
+    }
+
+    // Order: Unity registry packages, user assemblies, other packages; then by name.
+    List<string> SortRefs(IEnumerable<string> refs)
+    {
+        return refs.Distinct()
+            .OrderBy(r => (int)CategoryOf(r))
+            .ThenBy(r => RefName(r), StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
     // References are stored either as "GUID:xxxx" or by assembly name.
     Entry Resolve(string reference)
     {
@@ -655,12 +767,34 @@ public class AsmdefManagerWindow : EditorWindow
 
     // --------------------------------------------------------------- helpers
 
-    // "User-defined": project assets plus embedded/local packages (not registry/built-in/git).
-    static bool IsUserDefined(string assetPath)
+    // Unity registry: built-in modules and packages from Unity's default registry.
+    // User-defined: anything under Assets/ plus embedded/local packages.
+    // Other: git, tarball and third-party-registry packages.
+    static RefCategory GetCategory(string assetPath)
     {
         var pkg = PackageInfo.FindForAssetPath(assetPath);
-        if (pkg == null) return assetPath.StartsWith("Assets/", StringComparison.Ordinal);
-        return pkg.source == PackageSource.Embedded || pkg.source == PackageSource.Local;
+        if (pkg == null)
+            return assetPath.StartsWith("Assets/", StringComparison.Ordinal)
+                ? RefCategory.UserAssembly
+                : RefCategory.Unknown;
+
+        switch (pkg.source)
+        {
+            case PackageSource.Registry:
+                return RefCategory.Registry;
+            case PackageSource.BuiltIn:
+                return RefCategory.BuiltIn;
+            case PackageSource.Embedded:
+                return RefCategory.Embedded;
+            case PackageSource.Local:
+                return RefCategory.Local;
+            case PackageSource.Git:
+                return RefCategory.Git;
+            case PackageSource.LocalTarball:
+                return RefCategory.LocalTarball;
+            default:
+                return RefCategory.Unknown;
+        }
     }
 
     static string GetFullPath(string assetPath)
