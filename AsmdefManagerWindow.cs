@@ -33,8 +33,8 @@ public class AsmdefManagerWindow : EditorWindow
     VisualElement inspectorHost;
     VisualElement pendingHost;
     VisualElement refsHost;
-    ToolbarButton applyButton;
-    ToolbarButton discardButton;
+    Button applyButton;
+    Button discardButton;
     // The assembly selected in the list: target of ">" and subject of the 2nd view.
     Entry InspectedEntry => FindByPath(selectedPath);
 
@@ -88,16 +88,14 @@ public class AsmdefManagerWindow : EditorWindow
         };
         sortToggle.RegisterValueChangedCallback(e => sortOnApply = e.newValue);
         toolbar.Add(sortToggle);
+        toolbar.Add(new ToolbarButton(() => ReloadEntries(true)) { text = "Refresh" });
+        root.Add(toolbar);
 
-        applyButton = new ToolbarButton(ApplyPending)
+        applyButton = new Button(ApplyPending)
         {
             tooltip = "Write all staged references to disk in one batch (one compile)."
         };
-        toolbar.Add(applyButton);
-        discardButton = new ToolbarButton(DiscardPending) { text = "Discard" };
-        toolbar.Add(discardButton);
-        toolbar.Add(new ToolbarButton(() => ReloadEntries(true)) { text = "Refresh" });
-        root.Add(toolbar);
+        discardButton = new Button(DiscardPending) { text = "Discard" };
 
         // Assemblies view: split view
         var split = new TwoPaneSplitView(0, 260, TwoPaneSplitViewOrientation.Horizontal);
@@ -118,6 +116,41 @@ public class AsmdefManagerWindow : EditorWindow
         split.Add(inspectorHost);
 
         ReloadEntries(true);
+    }
+
+    // ---------------------------------------------------------- asset picker
+
+    static readonly int PickerControlId = "AsmdefManager.Picker".GetHashCode();
+
+    // Opens Unity's "Select Assembly Definition Asset" object picker.
+    void ShowAssemblyPicker()
+    {
+        if (InspectedEntry == null) return;
+        EditorGUIUtility.ShowObjectPicker<UnityEditorInternal.AssemblyDefinitionAsset>(
+            null, false, "", PickerControlId);
+    }
+
+    // The object picker reports its result through IMGUI command events.
+    void OnGUI()
+    {
+        var e = Event.current;
+        if (e.type != EventType.ExecuteCommand) return;
+        if (e.commandName != "ObjectSelectorClosed") return;
+        if (EditorGUIUtility.GetObjectPickerControlID() != PickerControlId) return;
+
+        var picked = EditorGUIUtility.GetObjectPickerObject();
+        e.Use();
+        if (picked == null) return;
+
+        var target = InspectedEntry;
+        if (target == null) return;
+
+        var path = AssetDatabase.GetAssetPath(picked);
+        var guid = AssetDatabase.AssetPathToGUID(path);
+        if (string.IsNullOrEmpty(guid)) return;
+
+        var name = infoByGuid.TryGetValue(guid, out var info) ? info.Name : picked.name;
+        StageReference(target, guid, name, FindByGuid(guid));
     }
 
     // Called by Unity whenever the project's assets change.
@@ -482,10 +515,24 @@ public class AsmdefManagerWindow : EditorWindow
         refsHost.style.paddingLeft = 6;
         refsHost.style.paddingRight = 6;
 
-        var heading = new Label(fileSorted ? "References" : "References (file order is not sorted)");
+        var headingRow = new VisualElement();
+        headingRow.style.flexDirection = FlexDirection.Row;
+        headingRow.style.alignItems = Align.Center;
+        headingRow.style.marginBottom = 2;
+
+        var heading = new Label(fileSorted ? "References" : "References <color=yellow>(unsorted)</color>");
         heading.style.unityFontStyleAndWeight = FontStyle.Bold;
-        heading.style.marginBottom = 2;
-        refsHost.Add(heading);
+        headingRow.Add(heading);
+
+        var plusBtn = new Button(ShowAssemblyPicker)
+        {
+            text = "+",
+            tooltip = $"Pick an Assembly Definition Asset to add as a reference of '{entry.Name}'"
+        };
+        plusBtn.style.width = 20;
+        plusBtn.style.marginLeft = 4;
+        headingRow.Add(plusBtn);
+        refsHost.Add(headingRow);
 
         if (sortedAll.Count == 0)
         {
@@ -508,9 +555,42 @@ public class AsmdefManagerWindow : EditorWindow
 
             foreach (var r in items)
             {
-                var line = new Label(RefName(r) + (staged.Contains(r) ? "  (staged)" : ""));
-                line.style.opacity = 0.8f;
-                line.style.paddingLeft = 10;
+                bool isStaged = staged.Contains(r);
+
+                var line = new VisualElement();
+                line.style.height = 18;
+                line.style.flexDirection = FlexDirection.Row;
+                line.style.alignItems = Align.Center;
+
+                var name = new Label(RefName(r));
+                name.style.flexGrow = 1;
+                name.style.opacity = 0.8f;
+                name.style.paddingLeft = 10;
+                if (isStaged)
+                {
+                    name.style.color = Color.green;
+                }
+                line.Add(name);
+
+                var discardChangeBtn = new Button(() =>
+                {
+                    var captured = pending.FirstOrDefault(p => p.targetPath == entry.Path && p.sourceGuid == r.Split(':')[1]);
+                    pending.Remove(captured);
+                    RefreshAll();
+                })
+                { text = "x", tooltip = "Discard this staged reference" };
+
+                line.RegisterCallback<PointerEnterEvent>(_ =>
+                {
+                    line.style.backgroundColor = HoverColor;
+                    if (isStaged) line.Add(discardChangeBtn);
+                });
+                line.RegisterCallback<PointerLeaveEvent>(_ =>
+                {
+                    line.style.backgroundColor = Color.clear;
+                    if (isStaged) line.Remove(discardChangeBtn);
+                });
+
                 refsHost.Add(line);
             }
         }
@@ -530,7 +610,7 @@ public class AsmdefManagerWindow : EditorWindow
 
         if (items.Count == 0)
         {
-            var hint = new Label("No staged references. Use \">\" or drag another assembly onto an entry.");
+            var hint = new Label("No staged references.");
             hint.style.paddingLeft = 6;
             hint.style.opacity = 0.6f;
             hint.style.whiteSpace = WhiteSpace.Normal;
@@ -546,31 +626,19 @@ public class AsmdefManagerWindow : EditorWindow
         pendingHost.style.paddingBottom = 4;
         pendingHost.style.marginBottom = 4;
 
-        var heading = new Label("Staged references (not applied yet)");
-        heading.style.unityFontStyleAndWeight = FontStyle.Bold;
-        pendingHost.Add(heading);
+        var headingRow = new VisualElement();
+        headingRow.style.flexDirection = FlexDirection.Row;
+        headingRow.style.alignItems = Align.Center;
 
-        foreach (var item in items)
-        {
-            var captured = item;
-            var source = FindByGuid(item.sourceGuid);
+        var headingLabel = new Label("Staged references (not applied yet)");
+        headingLabel.style.unityFontStyleAndWeight = FontStyle.Bold;
+        headingLabel.style.flexGrow = 1;
+        headingRow.Add(headingLabel);
 
-            var line = new VisualElement();
-            line.style.flexDirection = FlexDirection.Row;
-            line.style.alignItems = Align.Center;
+        headingRow.Add(applyButton);
+        headingRow.Add(discardButton);
 
-            var name = new Label(source != null ? source.Name : item.sourceGuid);
-            name.style.flexGrow = 1;
-            line.Add(name);
-            line.Add(new Button(() =>
-            {
-                pending.Remove(captured);
-                RefreshAll();
-            })
-            { text = "x", tooltip = "Remove this staged reference" });
-
-            pendingHost.Add(line);
-        }
+        pendingHost.Add(headingRow);
     }
 
     // ------------------------------------------------------------ references
@@ -580,22 +648,33 @@ public class AsmdefManagerWindow : EditorWindow
     void AddReference(Entry target, Entry source)
     {
         if (target == source) return;
+        StageReference(target, source.Guid, source.Name, source);
+    }
 
-        if (EffectiveContains(target, source))
+    // sourceEntry is null when the source is not a user assembly (e.g. a package asmdef).
+    void StageReference(Entry target, string sourceGuid, string sourceName, Entry sourceEntry)
+    {
+        if (target.Guid == sourceGuid)
         {
-            ShowNotification(new GUIContent($"{target.Name} already references {source.Name}"));
+            ShowNotification(new GUIContent("An assembly can't reference itself"));
+            return;
+        }
+
+        if (EffectiveRefs(target).Any(r => ResolveInfo(r)?.Guid == sourceGuid))
+        {
+            ShowNotification(new GUIContent($"{target.Name} already references {sourceName}"));
             return;
         }
 
         // Unity rejects cyclic assembly references, so check (including staged ones).
-        if (Reaches(source, target, new HashSet<Entry>()))
+        if (sourceEntry != null && Reaches(sourceEntry, target, new HashSet<Entry>()))
         {
             ShowNotification(new GUIContent(
-                $"Cyclic reference: {source.Name} already depends on {target.Name}"));
+                $"Cyclic reference: {sourceName} already depends on {target.Name}"));
             return;
         }
 
-        pending.Add(new PendingRef { targetPath = target.Path, sourceGuid = source.Guid });
+        pending.Add(new PendingRef { targetPath = target.Path, sourceGuid = sourceGuid });
 
         if (autoApply)
         {
@@ -604,7 +683,7 @@ public class AsmdefManagerWindow : EditorWindow
         else
         {
             RefreshAll();
-            ShowNotification(new GUIContent($"Staged {source.Name} > {target.Name}"));
+            ShowNotification(new GUIContent($"Staged '{sourceName}' > '{target.Name}'"));
         }
     }
 
