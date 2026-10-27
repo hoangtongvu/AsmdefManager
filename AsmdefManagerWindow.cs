@@ -24,7 +24,10 @@ public class AsmdefManagerWindow : EditorWindow
     [SerializeField] bool autoApply;
     [SerializeField] bool sortOnApply = true;
     [SerializeField] List<PendingRef> pending = new();
+    [SerializeField] List<PendingRemoval> pendingRemovals = new();
     string search = "";
+
+    int PendingCount => pending.Count + pendingRemovals.Count;
 
     readonly List<Entry> entries = new();
     readonly Dictionary<string, AsmInfo> infoByGuid = new();
@@ -170,6 +173,7 @@ public class AsmdefManagerWindow : EditorWindow
     public override void DiscardChanges()
     {
         pending.Clear();
+        pendingRemovals.Clear();
         base.DiscardChanges();
     }
 
@@ -217,6 +221,13 @@ public class AsmdefManagerWindow : EditorWindow
         // Drop staged references whose assemblies no longer exist.
         pending.RemoveAll(p => FindByPath(p.targetPath) == null || FindByGuid(p.sourceGuid) == null);
 
+        // Drop staged removals whose assembly is gone or whose reference no longer exists on disk.
+        pendingRemovals.RemoveAll(r =>
+        {
+            var owner = FindByPath(r.targetPath);
+            return owner == null || !(owner.Data.references ?? new string[0]).Contains(r.reference);
+        });
+
         RebuildList();
         if (inspectorInvalid) BuildInspector();
         else UpdatePendingPanel();
@@ -258,7 +269,6 @@ public class AsmdefManagerWindow : EditorWindow
         // Small status text: "+2" = number of staged references.
         var info = new Label { name = "info", pickingMode = PickingMode.Ignore };
         info.style.fontSize = 10;
-        info.style.opacity = 0.8f;
         info.style.marginLeft = 4;
         info.style.marginRight = 4;
         info.style.flexShrink = 0;
@@ -386,7 +396,9 @@ public class AsmdefManagerWindow : EditorWindow
 
         int stagedCount = pending.Count(p => p.targetPath == entry.Path);
         var infoParts = new List<string>();
-        if (stagedCount > 0) infoParts.Add("+" + stagedCount);
+        if (stagedCount > 0) infoParts.Add($"<color=#12ff12>+{stagedCount}</color>");
+        int removedCount = pendingRemovals.Count(r => r.targetPath == entry.Path);
+        if (removedCount > 0) infoParts.Add($"<color=#ff7878>-{removedCount}</color>");
         row.Q<Label>("info").text = string.Join(" ", infoParts);
 
         var btn = row.Q<Button>("addRef");
@@ -430,10 +442,10 @@ public class AsmdefManagerWindow : EditorWindow
     void UpdateToolbar()
     {
         if (applyButton == null) return;
-        applyButton.text = $"Apply ({pending.Count})";
-        applyButton.SetEnabled(pending.Count > 0);
-        discardButton.SetEnabled(pending.Count > 0);
-        hasUnsavedChanges = pending.Count > 0;
+        applyButton.text = $"Apply ({PendingCount})";
+        applyButton.SetEnabled(PendingCount > 0);
+        discardButton.SetEnabled(PendingCount > 0);
+        hasUnsavedChanges = PendingCount > 0;
     }
 
     // -------------------------------------------------------------- selection
@@ -510,7 +522,10 @@ public class AsmdefManagerWindow : EditorWindow
         bool fileSorted = disk.SequenceEqual(SortRefs(disk));
         var staged = new HashSet<string>(
             pending.Where(p => p.targetPath == entry.Path).Select(p => "GUID:" + p.sourceGuid));
-        var sortedAll = SortRefs(EffectiveRefs(entry));
+        var removed = new HashSet<string>(
+            pendingRemovals.Where(x => x.targetPath == entry.Path).Select(x => x.reference));
+        // Show removed references too (struck out) so the removal can be undone before Apply.
+        var sortedAll = SortRefs(disk.Concat(staged));
 
         refsHost.style.paddingLeft = 6;
         refsHost.style.paddingRight = 6;
@@ -556,6 +571,7 @@ public class AsmdefManagerWindow : EditorWindow
             foreach (var r in items)
             {
                 bool isStaged = staged.Contains(r);
+                bool isRemoved = !isStaged && removed.Contains(r);
 
                 var line = new VisualElement();
                 line.style.height = 18;
@@ -570,25 +586,59 @@ public class AsmdefManagerWindow : EditorWindow
                 {
                     name.style.color = Color.green;
                 }
+                else if (isRemoved)
+                {
+                    name.style.color = new Color(0.9f, 0.35f, 0.35f, 1f);
+                    name.style.opacity = 0.7f;
+                }
                 line.Add(name);
 
-                var discardChangeBtn = new Button(() =>
+                // Staged addition: "x" discards it.
+                // Existing reference: "x" stages its removal.
+                // Reference staged for removal: "undo" cancels the removal.
+                var actionBtn = new Button(() =>
                 {
-                    var captured = pending.FirstOrDefault(p => p.targetPath == entry.Path && p.sourceGuid == r.Split(':')[1]);
-                    pending.Remove(captured);
-                    RefreshAll();
-                })
-                { text = "x", tooltip = "Discard this staged reference" };
+                    if (isStaged)
+                    {
+                        var captured = pending.FirstOrDefault(p => p.targetPath == entry.Path && p.sourceGuid == r.Split(':')[1]);
+                        pending.Remove(captured);
+                        RefreshAll();
+                    }
+                    else if (isRemoved)
+                    {
+                        pendingRemovals.RemoveAll(x => x.targetPath == entry.Path && x.reference == r);
+                        RefreshAll();
+                    }
+                    else
+                    {
+                        StageRemoval(entry, r);
+                    }
+                });
+                if (isStaged)
+                {
+                    actionBtn.text = "x";
+                    actionBtn.tooltip = "Discard this staged reference";
+                }
+                else if (isRemoved)
+                {
+                    actionBtn.text = "undo";
+                    actionBtn.tooltip = "Keep this reference (cancel the staged removal)";
+                }
+                else
+                {
+                    actionBtn.text = "x";
+                    actionBtn.tooltip = $"Remove '{RefName(r)}' from the references of '{entry.Name}'";
+                }
 
                 line.RegisterCallback<PointerEnterEvent>(_ =>
                 {
                     line.style.backgroundColor = HoverColor;
-                    if (isStaged) line.Add(discardChangeBtn);
+                    line.Add(actionBtn);
                 });
                 line.RegisterCallback<PointerLeaveEvent>(_ =>
                 {
                     line.style.backgroundColor = Color.clear;
-                    if (isStaged) line.Remove(discardChangeBtn);
+                    if (actionBtn.parent == line) line.Remove(actionBtn);
                 });
 
                 refsHost.Add(line);
@@ -604,13 +654,14 @@ public class AsmdefManagerWindow : EditorWindow
         pendingHost.Clear();
 
         var entry = InspectedEntry;
-        var items = entry == null
-            ? new List<PendingRef>()
-            : pending.Where(p => p.targetPath == entry.Path).ToList();
+        int itemCount = entry == null
+            ? 0
+            : pending.Count(p => p.targetPath == entry.Path) +
+              pendingRemovals.Count(r => r.targetPath == entry.Path);
 
-        if (items.Count == 0)
+        if (itemCount == 0)
         {
-            var hint = new Label("No staged references.");
+            var hint = new Label("No staged changes.");
             hint.style.paddingLeft = 6;
             hint.style.opacity = 0.6f;
             hint.style.whiteSpace = WhiteSpace.Normal;
@@ -630,7 +681,7 @@ public class AsmdefManagerWindow : EditorWindow
         headingRow.style.flexDirection = FlexDirection.Row;
         headingRow.style.alignItems = Align.Center;
 
-        var headingLabel = new Label("Staged references (not applied yet)");
+        var headingLabel = new Label("Staged changes (not applied yet)");
         headingLabel.style.unityFontStyleAndWeight = FontStyle.Bold;
         headingLabel.style.flexGrow = 1;
         headingRow.Add(headingLabel);
@@ -666,6 +717,17 @@ public class AsmdefManagerWindow : EditorWindow
             return;
         }
 
+        // Re-adding a reference that was staged for removal simply cancels the removal.
+        var cancelled = pendingRemovals.FirstOrDefault(x =>
+            x.targetPath == target.Path && ResolveInfo(x.reference)?.Guid == sourceGuid);
+        if (cancelled != null)
+        {
+            pendingRemovals.Remove(cancelled);
+            RefreshAll();
+            ShowNotification(new GUIContent($"Kept '{sourceName}' in '{target.Name}'"));
+            return;
+        }
+
         // Unity rejects cyclic assembly references, so check (including staged ones).
         if (sourceEntry != null && Reaches(sourceEntry, target, new HashSet<Entry>()))
         {
@@ -687,6 +749,25 @@ public class AsmdefManagerWindow : EditorWindow
         }
     }
 
+    // Stages the removal of an existing reference (raw asmdef string) from "target".
+    // Nothing is written until ApplyPending runs, unless "Auto apply" is on.
+    void StageRemoval(Entry target, string reference)
+    {
+        if (pendingRemovals.Any(x => x.targetPath == target.Path && x.reference == reference)) return;
+
+        pendingRemovals.Add(new PendingRemoval { targetPath = target.Path, reference = reference });
+
+        if (autoApply)
+        {
+            ApplyPending();
+        }
+        else
+        {
+            RefreshAll();
+            ShowNotification(new GUIContent($"Staged removal of '{RefName(reference)}' from '{target.Name}'"));
+        }
+    }
+
     void ApplyPending() => WriteReferences(null, sortOnApply);
 
     void SortReferences(Entry target) => WriteReferences(target.Path, true);
@@ -698,7 +779,9 @@ public class AsmdefManagerWindow : EditorWindow
     {
         var paths = onlyPath != null
             ? new List<string> { onlyPath }
-            : pending.Select(p => p.targetPath).Distinct().ToList();
+            : pending.Select(p => p.targetPath)
+                .Concat(pendingRemovals.Select(r => r.targetPath))
+                .Distinct().ToList();
         if (paths.Count == 0) return;
 
         int written = 0;
@@ -714,6 +797,8 @@ public class AsmdefManagerWindow : EditorWindow
                 var data = JsonUtility.FromJson<AsmdefData>(File.ReadAllText(target.FullPath));
                 var original = data.references ?? new string[0];
                 var refs = original.ToList();
+                foreach (var rem in pendingRemovals.Where(x => x.targetPath == path))
+                    refs.RemoveAll(r => r == rem.reference);
                 foreach (var p in pending.Where(p => p.targetPath == path))
                 {
                     var r = "GUID:" + p.sourceGuid;
@@ -740,6 +825,7 @@ public class AsmdefManagerWindow : EditorWindow
         }
 
         pending.RemoveAll(p => paths.Contains(p.targetPath));
+        pendingRemovals.RemoveAll(r => paths.Contains(r.targetPath));
         ShowNotification(new GUIContent(written == 0
             ? "Nothing to change"
             : $"Updated references of {written} assembl{(written == 1 ? "y" : "ies")}"));
@@ -749,13 +835,15 @@ public class AsmdefManagerWindow : EditorWindow
     void DiscardPending()
     {
         pending.Clear();
+        pendingRemovals.Clear();
         RefreshAll();
     }
 
-    // Disk references + staged references.
+    // Disk references - staged removals + staged additions.
     IEnumerable<string> EffectiveRefs(Entry e)
     {
-        var onDisk = e.Data.references ?? new string[0];
+        var onDisk = (e.Data.references ?? new string[0])
+            .Where(r => !pendingRemovals.Any(x => x.targetPath == e.Path && x.reference == r));
         var staged = pending.Where(p => p.targetPath == e.Path).Select(p => "GUID:" + p.sourceGuid);
         return onDisk.Concat(staged);
     }
