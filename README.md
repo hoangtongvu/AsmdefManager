@@ -10,7 +10,7 @@
 - Add/Remove assembly references to/from the selected assembly
 - Sort and auto-sort assembly references based on categories
 
-<img width="1445" height="496" alt="preview" src="https://github.com/user-attachments/assets/a0740128-a476-4b06-8816-05551bce98c3" />
+<img width="1444" height="596" alt="preview" src="https://github.com/user-attachments/assets/ce050995-f6ba-4d20-a798-437149c0735b" />
 
 ## Installation
 
