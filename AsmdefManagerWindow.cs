@@ -35,7 +35,10 @@ public class AsmdefManagerWindow : EditorWindow
     ScrollView listScroll;
     VisualElement inspectorHost;
     VisualElement pendingHost;
+    Tab refsTab;
     VisualElement refsHost;
+    Tab reversedRefsTab;
+    VisualElement reversedRefsHost;
     Button applyButton;
     Button discardButton;
     // The assembly selected in the list: target of ">" and subject of the 2nd view.
@@ -469,7 +472,10 @@ public class AsmdefManagerWindow : EditorWindow
 
         inspectorHost.Clear();
         pendingHost = null;
+        refsTab = null;
         refsHost = null;
+        reversedRefsTab = null;
+        reversedRefsHost = null;
 
         // Show nothing if no entry is selected.
         var entry = InspectedEntry;
@@ -496,17 +502,115 @@ public class AsmdefManagerWindow : EditorWindow
         });
         inspectorHost.Add(header);
 
+        // Tab bar: References | Reversed References
+        var tabView = new TabView();
+        refsTab = new Tab("References");
+        reversedRefsTab = new Tab("Reversed References");
+
+        // References tab: staged changes panel + references list.
+        var refsScroll = new ScrollView(ScrollViewMode.Vertical);
+        refsScroll.style.flexGrow = 1;
+        refsHost = new VisualElement();
+        refsScroll.Add(refsHost);
+        refsTab.Add(refsScroll);
+        tabView.Add(refsTab);
+
+        // Reversed References tab: assemblies that reference the selected one.
+        var reversedScroll = new ScrollView(ScrollViewMode.Vertical);
+        reversedScroll.style.flexGrow = 1;
+        reversedRefsHost = new VisualElement();
+        reversedScroll.Add(reversedRefsHost);
+        reversedRefsTab.Add(reversedScroll);
+        tabView.Add(reversedRefsTab);
+
         pendingHost = new VisualElement();
         inspectorHost.Add(pendingHost);
-
-        var scroll = new ScrollView(ScrollViewMode.Vertical);
-        scroll.style.flexGrow = 1;
-        refsHost = new VisualElement();
-        scroll.Add(refsHost);
-        inspectorHost.Add(scroll);
+        inspectorHost.Add(tabView);
 
         UpdatePendingPanel();
         UpdateToolbar();
+    }
+
+    // Reversed References tab: every user-defined assembly that references the
+    // inspected one (disk state, plus staged additions / removals).
+    void UpdateReversedRefsPanel()
+    {
+        if (reversedRefsHost == null) return;
+        reversedRefsHost.Clear();
+        reversedRefsHost.style.paddingLeft = 6;
+        reversedRefsHost.style.paddingRight = 6;
+
+        var entry = InspectedEntry;
+        if (entry == null) return;
+
+        // (referrer, state) where state: 0 = on disk, 1 = staged addition, 2 = staged removal
+        var items = new List<(Entry owner, int state)>();
+        foreach (var other in entries)
+        {
+            if (other == entry) continue;
+
+            bool onDisk = (other.Data.references ?? new string[0]).Any(r => Resolve(r) == entry);
+            bool effective = EffectiveContains(other, entry);
+
+            if (effective && onDisk) items.Add((other, 0));
+            else if (effective) items.Add((other, 1));
+            else if (onDisk) items.Add((other, 2));
+        }
+
+        int count = items.Count(i => i.state != 2);
+        if (reversedRefsTab != null)
+            reversedRefsTab.label = $"Reversed References ({count})";
+
+        var heading = new Label($"Referenced by ({count})");
+        heading.style.unityFontStyleAndWeight = FontStyle.Bold;
+        heading.style.marginBottom = 2;
+        reversedRefsHost.Add(heading);
+
+        if (items.Count == 0)
+        {
+            var none = new Label($"No user-defined assembly references '{entry.Name}'.");
+            none.style.opacity = 0.6f;
+            none.style.whiteSpace = WhiteSpace.Normal;
+            reversedRefsHost.Add(none);
+            return;
+        }
+
+        foreach (var (owner, state) in items.OrderBy(i => i.owner.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            var line = new VisualElement { tooltip = owner.Path };
+            line.style.height = 18;
+            line.style.flexDirection = FlexDirection.Row;
+            line.style.alignItems = Align.Center;
+
+            var name = new Label(owner.Name) { pickingMode = PickingMode.Ignore };
+            name.style.flexGrow = 1;
+            name.style.flexShrink = 1;
+            name.style.overflow = Overflow.Hidden;
+            name.style.paddingLeft = 10;
+            name.style.opacity = 0.8f;
+            if (state == 1)
+            {
+                name.text += "  (staged)";
+                name.style.color = Color.green;
+            }
+            else if (state == 2)
+            {
+                name.text += "  (removal staged)";
+                name.style.color = new Color(0.9f, 0.35f, 0.35f, 1f);
+                name.style.opacity = 0.7f;
+            }
+            line.Add(name);
+
+            line.RegisterCallback<PointerEnterEvent>(_ => line.style.backgroundColor = HoverColor);
+            line.RegisterCallback<PointerLeaveEvent>(_ => line.style.backgroundColor = Color.clear);
+            // Click to jump to that assembly.
+            line.RegisterCallback<PointerUpEvent>(e =>
+            {
+                if (e.button == 0) Select(owner);
+            });
+
+            reversedRefsHost.Add(line);
+        }
     }
 
     // Shows the assembly's references (disk + staged) grouped by category.
@@ -650,6 +754,7 @@ public class AsmdefManagerWindow : EditorWindow
     void UpdatePendingPanel()
     {
         UpdateRefsPanel();
+        UpdateReversedRefsPanel();
         if (pendingHost == null) return;
         pendingHost.Clear();
 
